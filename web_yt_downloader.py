@@ -6,6 +6,8 @@ import tempfile
 import shutil
 import streamlit as st
 from pathlib import Path
+import time
+import random
 
 # ---------- Helpers ----------
 def time_to_seconds(time_str):
@@ -38,55 +40,94 @@ def check_ffmpeg():
             test_result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
             if test_result.returncode == 0:
                 return True, ffmpeg_path
-        return False, None
+        return False, "ffmpeg not found in PATH"
     except Exception as e:
         return False, str(e)
 
+def get_ydl_opts_safe(tmpdir, ffmpeg_available=False):
+    """Get yt-dlp options that work around 403 errors."""
+    
+    # User agents to rotate through
+    user_agents = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ]
+    
+    base_opts = {
+        'outtmpl': os.path.join(tmpdir, "%(title)s.%(ext)s"),
+        'user_agent': random.choice(user_agents),
+        'extractor_retries': 3,
+        'fragment_retries': 3,
+        'http_chunk_size': 10485760,  # 10MB chunks
+        'sleep_interval': 1,
+        'max_sleep_interval': 5,
+        'ignoreerrors': False,
+        'no_warnings': False,
+    }
+    
+    if ffmpeg_available:
+        # High quality with merging if ffmpeg is available
+        base_opts.update({
+            'format': 'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+            'merge_output_format': 'mp4',
+        })
+    else:
+        # Single file format to avoid needing ffmpeg
+        base_opts['format'] = 'best[ext=mp4][height<=720]/best[height<=720]/best'
+    
+    return base_opts
+
 def fetch_info(url):
     """Fetch metadata only (no video download)."""
-    ydl_opts = {"quiet": True, "skip_download": True}
+    ydl_opts = {
+        "quiet": True, 
+        "skip_download": True,
+        "user_agent": 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 @st.cache_resource
 def download_video(url):
-    """Download full video with improved format selection."""
+    """Download full video with improved error handling."""
     tmpdir = tempfile.mkdtemp()
     
     # Check if ffmpeg is available
     ffmpeg_available, ffmpeg_path = check_ffmpeg()
     
-    if ffmpeg_available:
-        # If ffmpeg is available, we can use the best quality with merging
-        ydl_opts = {
-            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-        }
-    else:
-        # If ffmpeg is not available, use single-file formats only
-        ydl_opts = {
-            "format": "best[ext=mp4]/best",
-            "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
-        }
+    # Get appropriate options
+    ydl_opts = get_ydl_opts_safe(tmpdir, ffmpeg_available)
     
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            video_path = ydl.prepare_filename(info)
-            
-            # Handle case where extension changes
-            if not os.path.exists(video_path):
-                # Look for any file in the directory
-                files = os.listdir(tmpdir)
-                if files:
-                    video_path = os.path.join(tmpdir, files[0])
-                else:
-                    raise FileNotFoundError("Downloaded file not found")
-            
-            return video_path, info
-    except Exception as e:
-        raise RuntimeError(f"Video download failed: {e}")
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                st.info(f"Download attempt {attempt + 1}/{max_retries}...")
+                info = ydl.extract_info(url, download=True)
+                
+                # Find the downloaded file
+                expected_path = ydl.prepare_filename(info)
+                
+                if os.path.exists(expected_path):
+                    return expected_path, info
+                
+                # Look for any video file in the directory
+                for file in os.listdir(tmpdir):
+                    if file.endswith(('.mp4', '.mkv', '.webm', '.avi')):
+                        actual_path = os.path.join(tmpdir, file)
+                        return actual_path, info
+                
+                raise FileNotFoundError("Downloaded file not found")
+                
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise RuntimeError(f"Video download failed after {max_retries} attempts: {e}")
+            else:
+                st.warning(f"Attempt {attempt + 1} failed: {str(e)[:100]}... Retrying...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+    
+    raise RuntimeError("All download attempts failed")
 
 def split_all_chapters(video_path, chapters):
     """Split video into chapters using ffmpeg."""
@@ -101,13 +142,13 @@ def split_all_chapters(video_path, chapters):
 
     for i, (title, start) in enumerate(chapters):
         end = chapters[i+1][1] if i+1 < len(chapters) else None
-        safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", title)[:50]  # Limit filename length
         output_file = os.path.join(chapters_folder, f"{i+1:02d} - {safe_title}.mp4")
 
         cmd = ["ffmpeg", "-i", video_path, "-ss", str(start)]
         if end:
             cmd += ["-t", str(end - start)]
-        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", output_file]
+        cmd += ["-c", "copy", "-avoid_negative_ts", "make_zero", "-y", output_file]
         
         try:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
@@ -126,57 +167,82 @@ st.title("🎬 YouTube Downloader with Chapters")
 # Debug information
 ffmpeg_available, ffmpeg_info = check_ffmpeg()
 if ffmpeg_available:
-    st.success(f"✅ ffmpeg is available at: {ffmpeg_info}")
+    st.success(f"✅ ffmpeg is available")
 else:
-    st.error(f"❌ ffmpeg not found: {ffmpeg_info}")
+    st.error(f"❌ ffmpeg not found")
     st.warning("Chapter splitting will be disabled. Only full video downloads will work.")
+    st.info("💡 To enable chapter splitting, make sure 'ffmpeg' is in your packages.txt file in the root directory.")
 
-url = st.text_input("Enter YouTube URL")
+# Show yt-dlp version
+try:
+    import yt_dlp
+    st.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+except:
+    st.warning("Could not determine yt-dlp version")
+
+url = st.text_input("Enter YouTube URL", placeholder="https://www.youtube.com/watch?v=...")
 
 if url:
+    if not url.startswith(('https://www.youtube.com/', 'https://youtu.be/')):
+        st.error("Please enter a valid YouTube URL")
+        st.stop()
+    
     with st.spinner("Fetching video info..."):
         try:
             info = fetch_info(url)
         except Exception as e:
-            st.error(f"Failed to fetch info: {e}")
+            st.error(f"Failed to fetch video info: {e}")
+            st.info("This might be due to YouTube restrictions. Try a different video or check if the URL is correct.")
             st.stop()
 
     st.success(f"✅ Video found: {info['title']}")
+    
+    # Show video duration
+    duration = info.get('duration', 0)
+    if duration:
+        duration_str = f"{duration // 3600:02d}:{(duration % 3600) // 60:02d}:{duration % 60:02d}"
+        st.info(f"Duration: {duration_str}")
+    
     description = info.get("description", "")
     chapters = extract_chapters(description)
 
     # ---- Full Video ----
-    if st.button("⬇️ Download Full Video"):
-        with st.spinner("Downloading full video..."):
+    st.subheader("📥 Full Video Download")
+    
+    if st.button("⬇️ Download Full Video", type="primary"):
+        with st.spinner("Downloading video... This may take a few minutes for longer videos."):
             try:
                 video_path, info_dl = download_video(url)
                 
                 # Check if file exists and get its size
                 if os.path.exists(video_path):
                     file_size = os.path.getsize(video_path)
-                    st.info(f"Video size: {file_size / (1024*1024):.1f} MB")
+                    st.success(f"✅ Video downloaded! Size: {file_size / (1024*1024):.1f} MB")
                     
                     with open(video_path, "rb") as f:
                         st.download_button(
-                            label="💾 Save Full Video",
+                            label="💾 Save Video to Your Device",
                             data=f,
                             file_name=f"{info_dl['title']}.mp4",
-                            mime="video/mp4"
+                            mime="video/mp4",
+                            use_container_width=True
                         )
-                    st.success("✅ Video downloaded successfully!")
                 else:
                     st.error("Video file not found after download")
                     
             except Exception as e:
-                st.error(f"Download failed: {e}")
-                # Show debug info
-                st.error("Debug info: If you see 'ffmpeg not found', the issue is with the deployment setup.")
+                st.error(f"❌ Download failed: {e}")
+                if "403" in str(e):
+                    st.info("💡 This is likely due to YouTube restrictions. Try:")
+                    st.info("- Using a different video")  
+                    st.info("- Checking if the video is region-locked")
+                    st.info("- Trying again later")
 
     # ---- Chapters ----
     if chapters:
         st.subheader("📖 Chapters Found")
         
-        # Show chapters list
+        # Show chapters list in a nice format
         for i, (title, start) in enumerate(chapters):
             minutes, seconds = divmod(start, 60)
             hours, minutes = divmod(minutes, 60)
@@ -184,18 +250,20 @@ if url:
                 time_str = f"{hours}:{minutes:02d}:{seconds:02d}"
             else:
                 time_str = f"{minutes}:{seconds:02d}"
-            st.write(f"{i+1}. {time_str} - {title}")
+            st.write(f"**{i+1}.** `{time_str}` - {title}")
         
         if ffmpeg_available:
-            if st.button("⬇️ Process All Chapters (ZIP)"):
-                with st.spinner("Downloading video and splitting chapters..."):
+            st.info("🎬 With ffmpeg available, you can download individual chapters!")
+            
+            if st.button("⬇️ Download All Chapters as ZIP", type="secondary"):
+                with st.spinner("Processing chapters... This will take several minutes."):
                     try:
                         video_path, _ = download_video(url)
                         zip_path = split_all_chapters(video_path, chapters)
                         st.session_state["chapters_zip"] = zip_path
                         st.success("✅ All chapters processed successfully!")
                     except Exception as e:
-                        st.error(f"Chapter processing failed: {e}")
+                        st.error(f"❌ Chapter processing failed: {e}")
 
             # Show download button only if zip ready
             if "chapters_zip" in st.session_state:
@@ -204,14 +272,14 @@ if url:
                         label="💾 Save All Chapters ZIP",
                         data=f,
                         file_name=f"{info['title']}_chapters.zip",
-                        mime="application/zip"
+                        mime="application/zip",
+                        use_container_width=True
                     )
         else:
-            st.error("❌ Chapter splitting requires ffmpeg. Please check your deployment setup.")
-            st.info("Make sure you have 'ffmpeg' in your packages.txt file in the root directory of your repository.")
+            st.warning("❌ Chapter downloading requires ffmpeg installation.")
 
     else:
-        st.info("No chapters found in description. Only full video available.")
+        st.info("📄 No chapters found in video description. Only full video download available.")
 
 # Debug section
 with st.expander("🔧 Debug Information"):
@@ -220,13 +288,26 @@ with st.expander("🔧 Debug Information"):
     st.write(f"- ffmpeg info: {ffmpeg_info}")
     
     # Check if packages.txt exists
-    if os.path.exists("packages.txt"):
-        st.write("- packages.txt found ✅")
-        with open("packages.txt", "r") as f:
-            st.write(f"- packages.txt content: {f.read()}")
-    else:
-        st.write("- packages.txt NOT found ❌")
+    packages_txt_paths = ["packages.txt", "../packages.txt", "../../packages.txt"]
+    packages_found = False
     
-    # Show environment variables
+    for path in packages_txt_paths:
+        if os.path.exists(path):
+            st.write(f"- packages.txt found at {path} ✅")
+            with open(path, "r") as f:
+                content = f.read().strip()
+                st.write(f"- packages.txt content: `{content}`")
+            packages_found = True
+            break
+    
+    if not packages_found:
+        st.write("- packages.txt NOT found ❌")
+        st.write("- **SOLUTION:** Create a `packages.txt` file in your repository root with content: `ffmpeg`")
+    
+    # Show current working directory
+    st.write(f"- Current working directory: {os.getcwd()}")
+    st.write(f"- Files in current directory: {os.listdir('.')}")
+    
+    # Show environment info
     st.write("**Environment:**")
-    st.write(f"- PATH: {os.environ.get('PATH', 'Not found')[:200]}...")
+    st.write(f"- PATH contains /usr/bin: {'/usr/bin' in os.environ.get('PATH', '')}")

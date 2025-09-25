@@ -1,4 +1,2 @@
 streamlit
-yt-dlp
-ffmpeg-python
-ffmpeg
+yt-dlp>=2024.12.13
